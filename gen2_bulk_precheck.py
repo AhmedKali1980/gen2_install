@@ -1,17 +1,25 @@
 import argparse
+import ast
 import csv
 import os
-from datetime import datetime
+import re
 import sys
 import traceback
+from datetime import datetime
+from time import sleep
+
 import requests
-from sg_iamaas import CachingTokenGenerator
-from config import OSC_API_URL
 from getpass import getpass
+from sg_iamaas import CachingTokenGenerator
+
+from config import OSC_API_URL
+from config import PCE_LIST
+
+FINAL_STATES = {"failed", "success"}
+ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
 
 
 def _read_csv_rows_with_auto_delimiter(input_path: str):
-    """Read CSV rows, auto-detecting delimiter and handling UTF-8 BOM."""
     try:
         with open(input_path, newline='', encoding='utf-8-sig') as infile:
             sample = infile.read(4096)
@@ -22,277 +30,233 @@ def _read_csv_rows_with_auto_delimiter(input_path: str):
             except Exception:
                 delimiter = ';'
             reader = csv.reader(infile, delimiter=delimiter)
-            rows = list(reader)
-            return rows, delimiter
+            return list(reader), delimiter
     except Exception as exc:
         print(f"Error: Unable to read input file '{input_path}': {exc}")
         sys.exit(1)
 
 
-def create_output_csv_with_extra_columns(input_path: str) -> str:
-    """
-    Create a copy of the input CSV file, appending 'error' and 'install_job_id'
-    columns. The output file is saved in the same directory as the input file,
-    with the name formatted as '%Y%m%d_%H%M%S_gen2_precheck_exec.csv'.
-
-    Args:
-        input_path (str): Path to the input CSV file.
-
-    Returns:
-        str: Path to the newly created output CSV file.
-
-    Raises:
-        SystemExit: If the input file cannot be read or does not respect the
-        required structure.
-    """
+def create_output_csv_with_extra_columns(input_path: str) -> tuple[str, str]:
     input_dir = os.path.dirname(input_path)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"{timestamp}_gen2_precheck_exec.csv"
+    output_filename = f"{timestamp}_gen2_precheck_result.csv"
     output_path = os.path.join(input_dir, output_filename)
 
     required_columns = ["server_id", "account_id"]
     rows, delimiter = _read_csv_rows_with_auto_delimiter(input_path)
-
     if not rows:
         print("Error: Input CSV is empty.")
         sys.exit(1)
 
-    header = [col.strip().lstrip('*').strip() for col in rows[0]]
-
+    cleaned_headers = [col.strip().lstrip('*').strip() for col in rows[0]]
     for col in required_columns:
-        if col not in header:
-            print(
-                f"Error: Input CSV missing required column '{col}'.\n"
-                "Expected header: *server_id, *account_id"
-            )
+        if col not in cleaned_headers:
+            print(f"Error: Input CSV missing required column '{col}'.")
             sys.exit(1)
 
-    col_indices = {col: header.index(col) for col in required_columns}
-    for i, row in enumerate(rows[1:], start=2):
-        for col, idx in col_indices.items():
-            if idx >= len(row) or not row[idx].strip():
-                print(
-                    f"Error: Row {i} is missing a value for required column "
-                    f"'{col}'."
-                )
-                sys.exit(1)
-
-    headers = rows[0] + ["error", "precheck_job_id"]
-    data_rows = rows[1:]
+    headers = rows[0] + [
+        "error", "precheck_job_id", "precheck_status", "1_os_check", "2_disk_space",
+        "3_dns_resolution", "4_ping", "5_port_access", "6_docker_chain",
+        "7_docker_ruleset", "8_podman", "9_podman_network", "10_podman_docker_cli",
+        "11_nat_iptable", "12_nat_nftable", "precheck_result"
+    ]
 
     with open(output_path, 'w', newline='', encoding='utf-8') as outfile:
         writer = csv.writer(outfile, delimiter=delimiter)
         writer.writerow(headers)
-        for row in data_rows:
-            writer.writerow(row + ["", ""])
+        for row in rows[1:]:
+            writer.writerow(row + [""] * 16)
 
-    return output_path
+    return output_path, delimiter
 
 
-def run_precheck_puppet_module(
-    osc_api_url: str,
-    server_id: str,
-    account_id: str,
-    access_control_token
-) -> object:
+def run_precheck_puppet_module(server_id: str, account_id: str, access_control_token) -> object:
     try:
-        url = f"{osc_api_url.rstrip('/')}/nodes/{server_id}/jobs/run-puppet"
+        url = f"{OSC_API_URL.rstrip('/')}/nodes/{server_id}/jobs/run-puppet"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"{access_control_token.authorization_header}",
             "X-Target-Account-Id": f"{account_id}"
         }
-        payload = {
-            "osType": "linux",
-            "skipTags": [],
-            "tags": ["sg_illumio_ven::precheck"]
-        }
+        payload = {"osType": "linux", "skipTags": [], "tags": ["sg_illumio_ven::precheck_output"]}
         response = requests.post(url, json=payload, headers=headers)
         if response.status_code != 202:
-            return {
-                'error': f"{response.status_code or 'OS Configuration agent install puppet run error :'}: {response.text}"
-            }
-        try:
-            resp_json = response.json()
-        except Exception as exc:
-            return {
-                'error': f"OS Configuration agent install puppet run error : Invalid JSON response: {str(exc)}"
-            }
-        job = resp_json.get("job", {})
-        job_id = job.get("id", "")
-        status = job.get("status", "")
-        reason = job.get("reason", "")
-        if job_id:
-            return job_id
-        return {
-            'error': f"OS Configuration agent install puppet run error : job_id:[{job_id}] status:{status} reason:{reason}"
-        }
+            return {'error': f"{response.status_code}: {response.text}"}
+        job_id = response.json().get("job", {}).get("id", "")
+        return job_id if job_id else {'error': "No job id returned by API"}
     except Exception as exc:
-        status_code = getattr(exc, 'status_code', None)
-        return {
-            'error': f"{status_code or 'OS Configuration agent install puppet run error :'}: {str(exc)}"
-        }
+        return {'error': str(exc)}
 
 
-def associate_puppet_module_with_server(
-    osc_api_url: str,
-    server_id: str,
-    association_payload: dict,
-    account_id: str,
-    access_control_token
-) -> dict:
+def associate_puppet_module_with_server(server_id: str, account_id: str, access_control_token) -> dict:
     try:
-        if not osc_api_url or not server_id or not association_payload or not access_control_token:
-            return {'error': 'OS Configuration puppet module association error: Missing required parameters'}
-        url = f"{osc_api_url.rstrip('/')}/nodes/{server_id}/modules"
+        url = f"{OSC_API_URL.rstrip('/')}/nodes/{server_id}/modules"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"{access_control_token.authorization_header}",
             "X-Target-Account-Id": f"{account_id}"
         }
-
-        response = requests.patch(url, json=association_payload, headers=headers)
-        if response.status_code == 202:
-            return {}
-        return {
-            'error': f"OS Configuration puppet module association error : {response.status_code}: {response.text}"
-        }
+        payload = {"modules": [{"name": "sg_illumio_ven::precheck", "params": {}}]}
+        response = requests.patch(url, json=payload, headers=headers)
+        return {} if response.status_code == 202 else {'error': f"{response.status_code}: {response.text}"}
     except Exception as exc:
-        status_code = getattr(exc, 'status_code', None)
-        return {
-            'error': f"{status_code or 'OS Configuration puppet module association error'}: {str(exc)}"
-        }
+        return {'error': str(exc)}
 
 
-def change_server_puppet_environments(
-    osc_api_url: str,
-    server_id: str,
-    environment: str,
-    account_id: str,
-    access_control_token
-) -> dict:
+def dissociate_puppet_module_from_server(server_id: str, account_id: str, access_control_token) -> None:
+    if not server_id:
+        return
     try:
-        if not osc_api_url or not server_id or not environment or not access_control_token:
-            return {'error': 'OS Configuration puppet module association error: Missing required parameters'}
-        url = f"{osc_api_url.rstrip('/')}/nodes/{server_id}/environments"
+        url = f"{OSC_API_URL.rstrip('/')}/nodes/{server_id}/modules/sg_illumio_ven::precheck"
+        headers = {
+            "Authorization": f"{access_control_token.authorization_header}",
+            "X-Target-Account-Id": f"{account_id}"
+        }
+        requests.delete(url, headers=headers)
+    except Exception:
+        pass
+
+
+def change_server_puppet_environments(server_id: str, environment: str, account_id: str, access_control_token) -> dict:
+    try:
+        url = f"{OSC_API_URL.rstrip('/')}/nodes/{server_id}/environments"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"{access_control_token.authorization_header}",
             "X-Target-Account-Id": f"{account_id}"
         }
-
         response = requests.put(url, json={"environment": environment}, headers=headers)
-        if response.status_code == 200:
-            return {}
-        return {
-            'error': f"OS Configuration puppet module association error : {response.status_code}: {response.text}"
-        }
+        return {} if response.status_code == 200 else {'error': f"{response.status_code}: {response.text}"}
     except Exception as exc:
-        status_code = getattr(exc, 'status_code', None)
-        return {
-            'error': f"{status_code or 'OS Configuration puppet module association error'}: {str(exc)}"
-        }
+        return {'error': str(exc)}
+
+
+def _parse_precheck_reason(row, idxs, reason: str, pce_fqdn: str):
+    if not reason:
+        return
+    try:
+        lines = ast.literal_eval(reason)
+    except Exception:
+        return
+    clean_lines = [ANSI_ESCAPE.sub('', line).strip() for line in lines if str(line).strip()]
+    for line in clean_lines:
+        m = re.match(r'^(\d+)\..*(?:-|:|\()\s*(OK|KO)\)?$', line)
+        if m:
+            step, value = m.group(1), m.group(2)
+            mapping = {
+                '1': '1_os_check', '2': '2_disk_space', '6': '6_docker_chain', '7': '7_docker_ruleset',
+                '8': '8_podman', '9': '9_podman_network', '10': '10_podman_docker_cli',
+                '11': '11_nat_iptable', '12': '12_nat_nftable'
+            }
+            if step in mapping:
+                row[idxs[mapping[step]]] = value
+            continue
+        if line.startswith("DNS for") and pce_fqdn in line:
+            row[idxs['3_dns_resolution']] = 'OK' if 'OK' in line else 'KO'
+        if line.startswith("Ping to") and pce_fqdn in line:
+            row[idxs['4_ping']] = 'OK' if 'OK' in line else 'KO'
+        if line.startswith("Connection to") and pce_fqdn in line:
+            row[idxs['5_port_access']] = 'OK' if 'OK' in line else 'KO'
+
+
+def _compute_final_result(row, idxs):
+    keys = ['1_os_check', '2_disk_space', '3_dns_resolution', '4_ping', '5_port_access', '6_docker_chain', '7_docker_ruleset',
+            '8_podman', '9_podman_network', '10_podman_docker_cli', '11_nat_iptable', '12_nat_nftable']
+    row[idxs['precheck_result']] = 'OK' if all(row[idxs[k]] == 'OK' for k in keys) else 'KO'
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Bulk precheck on servers from a CSV file."
-    )
-    parser.add_argument('-f', '--file-path', type=str, required=True, help='Server list csv file path')
-    parser.add_argument('--osc-client-id', type=str, required=True, help='Client ID with OSConfiguration privileges')
-    parser.add_argument('--osc-client-secret', type=str, required=False, help='Client secret with OSConfiguration privileges')
-    parser.add_argument('--osc-account-id', type=str, required=True, help='Account ID with OSConfiguration privileges')
-
+    parser = argparse.ArgumentParser(description="Run + monitor Gen2 prechecks from one CSV.")
+    parser.add_argument('-f', '--file-path', type=str, required=True)
+    parser.add_argument('--pce', type=str, choices=['dev', 'uat', 'prd', 'prd_critapps'], required=True)
+    parser.add_argument('--osc-client-id', type=str, required=True)
+    parser.add_argument('--osc-client-secret', type=str, required=False)
+    parser.add_argument('--osc-account-id', type=str, required=True)
+    parser.add_argument('--batch-size', type=int, default=5)
+    parser.add_argument('--poll-interval', type=int, default=20)
     args = parser.parse_args()
+
     if not args.osc_client_secret:
         args.osc_client_secret = getpass(prompt='Osconfig Client secret: ')
 
-    output_csv = create_output_csv_with_extra_columns(args.file_path)
+    output_csv, delimiter = create_output_csv_with_extra_columns(args.file_path)
+    rows, _ = _read_csv_rows_with_auto_delimiter(output_csv)
+    headers, data_rows = rows[0], rows[1:]
+    idxs = {h.strip().lstrip('*').strip(): i for i, h in enumerate(headers)}
 
-    processed_rows = []
+    step_columns = ["1_os_check", "2_disk_space", "3_dns_resolution", "4_ping", "5_port_access", "6_docker_chain", "7_docker_ruleset", "8_podman", "9_podman_network", "10_podman_docker_cli", "11_nat_iptable", "12_nat_nftable", "precheck_result"]
+    for c in step_columns:
+        idxs[c] = headers.index(c)
 
-    with open(output_csv, newline='', encoding='utf-8-sig') as infile:
-        sample = infile.read(4096)
-        infile.seek(0)
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=';,\t')
-            delimiter = dialect.delimiter
-        except Exception:
-            delimiter = ';'
-        reader = csv.reader(infile, delimiter=delimiter)
-        headers = next(reader)
-        rows = list(reader)
-
-    header_map = {h.strip().lstrip('*').strip(): i for i, h in enumerate(headers)}
-    error_idx = len(headers) - 2
-    job_id_idx = len(headers) - 1
     scopes = ["osc:read", "osc:write"]
     acl_token_generator = CachingTokenGenerator(args.osc_client_id, args.osc_client_secret, args.osc_account_id, scopes)
+    pce_fqdn = "ilu-prd.fr.world.socgen" if args.pce == "prd" else PCE_LIST.get(args.pce, {}).get("fqdn", "")
 
-    for row in rows:
-        print('.')
-        try:
-            row_data = {h.strip().lstrip('*').strip(): row[idx] for h, idx in header_map.items() if idx < len(row)}
-
-            with acl_token_generator.generate() as token:
-                environment_result = change_server_puppet_environments(
-                    osc_api_url=OSC_API_URL,
-                    server_id=row_data["server_id"],
-                    environment="unstable",
-                    account_id=row_data["account_id"],
-                    access_control_token=token
-                )
-                if isinstance(environment_result, dict) and 'error' in environment_result:
-                    row[error_idx] = environment_result['error']
-                    processed_rows.append(row)
+    for start in range(0, len(data_rows), args.batch_size):
+        batch = data_rows[start:start + args.batch_size]
+        print(f"\n[Batch {start // args.batch_size + 1}] Launch prechecks for {len(batch)} servers...")
+        running = []
+        with acl_token_generator.generate() as token:
+            for row in batch:
+                sid = row[idxs['server_id']]
+                aid = row[idxs['account_id']]
+                print(f"  -> {sid}: switch env unstable + associate module + launch job")
+                for res in (
+                    change_server_puppet_environments(sid, "unstable", aid, token),
+                    associate_puppet_module_with_server(sid, aid, token),
+                ):
+                    if 'error' in res:
+                        row[idxs['error']] = res['error']
+                        break
+                if row[idxs['error']]:
                     continue
-
-                association_payload = {
-                    "modules": [
-                        {
-                            "name": "sg_illumio_ven::precheck",
-                            "params": {}
-                        }
-                    ]
-                }
-                association_result = associate_puppet_module_with_server(
-                    osc_api_url=OSC_API_URL,
-                    server_id=row_data["server_id"],
-                    association_payload=association_payload,
-                    account_id=row_data["account_id"],
-                    access_control_token=token
-                )
-                if isinstance(association_result, dict) and 'error' in association_result:
-                    row[error_idx] = association_result['error']
-                    processed_rows.append(row)
+                precheck = run_precheck_puppet_module(sid, aid, token)
+                if isinstance(precheck, dict):
+                    row[idxs['error']] = precheck['error']
                     continue
+                row[idxs['precheck_job_id']] = precheck
+                row[idxs['precheck_status']] = 'running'
+                running.append(row)
 
-                precheck_call_result = run_precheck_puppet_module(
-                    osc_api_url=OSC_API_URL,
-                    server_id=row_data["server_id"],
-                    account_id=row_data["account_id"],
-                    access_control_token=token
-                )
-                if isinstance(precheck_call_result, dict) and 'error' in precheck_call_result:
-                    row[error_idx] = precheck_call_result['error']
-                elif isinstance(precheck_call_result, str):
-                    row[job_id_idx] = precheck_call_result
-                processed_rows.append(row)
-        except Exception as e:
-            if "Missing Client ID or Secret" in str(e):
-                print("Error to get Access Control Token for OS Configuration API: Check osc_client_id/osc_client_secret/osc_account_id")
-                sys.exit(1)
-            row[error_idx] = traceback.format_exc()
-            processed_rows.append(row)
-            continue
+            while running:
+                print(f"  Monitoring {len(running)} running jobs...")
+                remaining = []
+                for row in running:
+                    sid, aid = row[idxs['server_id']], row[idxs['account_id']]
+                    job_id = row[idxs['precheck_job_id']]
+                    url = f"{OSC_API_URL.rstrip('/')}/jobs/{job_id}"
+                    headers_req = {"Authorization": token.authorization_header, "X-Target-Account-Id": aid}
+                    resp = requests.get(url, headers=headers_req)
+                    if resp.status_code != 200:
+                        row[idxs['error']] = f"{resp.status_code}: {resp.text}"
+                        row[idxs['precheck_status']] = 'error'
+                        continue
+                    job = resp.json().get('job', {})
+                    status = (job.get('status') or '').lower()
+                    row[idxs['precheck_status']] = status
+                    print(f"    - {sid}: {status}")
+                    _parse_precheck_reason(row, idxs, job.get('reason', ''), pce_fqdn)
+                    if status in FINAL_STATES:
+                        _compute_final_result(row, idxs)
+                        dissociate_puppet_module_from_server(sid, aid, token)
+                        change_server_puppet_environments(sid, 'stable', aid, token)
+                    else:
+                        remaining.append(row)
+                running = remaining
+                if running:
+                    sleep(args.poll_interval)
 
-    with open(output_csv, 'w', newline='', encoding='utf-8') as outfile:
-        writer = csv.writer(outfile, delimiter=delimiter)
+    with open(output_csv, 'w', newline='', encoding='utf-8') as out:
+        writer = csv.writer(out, delimiter=delimiter)
         writer.writerow(headers)
-        writer.writerows(processed_rows)
+        writer.writerows(data_rows)
 
-    print("END: check the output file.")
+    print(f"\nEND: precheck completed. Output CSV: {output_csv}")
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception:
+        print(traceback.format_exc())
+        sys.exit(1)
