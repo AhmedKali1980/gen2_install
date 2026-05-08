@@ -192,9 +192,12 @@ def main():
     acl_token_generator = CachingTokenGenerator(args.osc_client_id, args.osc_client_secret, args.osc_account_id, scopes)
     pce_fqdn = "ilu-prd.fr.world.socgen" if args.pce == "prd" else PCE_LIST.get(args.pce, {}).get("fqdn", "")
 
-    for start in range(0, len(data_rows), args.batch_size):
+    total_servers = len(data_rows)
+    for start in range(0, total_servers, args.batch_size):
         batch = data_rows[start:start + args.batch_size]
-        print(f"\n[Batch {start // args.batch_size + 1}] Launch prechecks for {len(batch)} servers...")
+        batch_no = start // args.batch_size + 1
+        processed_count = min(start + len(batch), total_servers)
+        print(f"\n[Batch {batch_no}] Launch prechecks for {len(batch)} servers ({processed_count}/{total_servers})...")
         running = []
         with acl_token_generator.generate() as token:
             for row in batch:
@@ -245,6 +248,12 @@ def main():
                 running = remaining
                 if running:
                     sleep(args.poll_interval)
+
+            print(f"  Cleanup batch {batch_no}: dissociate module for processed servers...")
+            for row in batch:
+                sid = row[idxs['server_id']]
+                aid = row[idxs['account_id']]
+                dissociate_puppet_module_from_server(sid, aid, token)
 
     with open(output_csv, 'w', newline='', encoding='utf-8') as out:
         writer = csv.writer(out, delimiter=delimiter)
