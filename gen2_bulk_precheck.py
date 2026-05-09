@@ -58,14 +58,14 @@ def create_output_csv_with_extra_columns(input_path: str) -> tuple[str, str]:
         "error", "precheck_job_id", "precheck_status", "1_os_check", "2_disk_space",
         "3_dns_resolution", "4_ping", "5_port_access", "6_docker_chain",
         "7_docker_ruleset", "8_podman", "9_podman_network", "10_podman_docker_cli",
-        "11_nat_iptable", "12_nat_nftable", "precheck_result"
+        "11_nat_iptable", "12_nat_nftable", "precheck_result", "precheck_retries"
     ]
 
     with open(output_path, 'w', newline='', encoding='utf-8') as outfile:
         writer = csv.writer(outfile, delimiter=delimiter)
         writer.writerow(headers)
         for row in rows[1:]:
-            writer.writerow(row + [""] * 16)
+            writer.writerow(row + [""] * 17)
 
     return output_path, delimiter
 
@@ -174,6 +174,8 @@ def main():
     parser.add_argument('--osc-account-id', type=str, required=True)
     parser.add_argument('--batch-size', type=int, default=5)
     parser.add_argument('--poll-interval', type=int, default=20)
+    parser.add_argument('--max-retries', type=int, default=None,
+                        help="Max number of monitoring checks per job. If set, it overrides default infinite monitoring.")
     args = parser.parse_args()
 
     if not args.osc_client_secret:
@@ -227,9 +229,12 @@ def main():
                 for row in running:
                     sid, aid = row[idxs['server_id']], row[idxs['account_id']]
                     job_id = row[idxs['precheck_job_id']]
+                    retries_count = int(row[idxs['precheck_retries']]) if row[idxs['precheck_retries']] else 0
                     url = f"{OSC_API_URL.rstrip('/')}/jobs/{job_id}"
                     headers_req = {"Authorization": token.authorization_header, "X-Target-Account-Id": aid}
                     resp = requests.get(url, headers=headers_req)
+                    retries_count += 1
+                    row[idxs['precheck_retries']] = str(retries_count)
                     if resp.status_code != 200:
                         row[idxs['error']] = f"{resp.status_code}: {resp.text}"
                         row[idxs['precheck_status']] = 'error'
@@ -241,6 +246,11 @@ def main():
                     _parse_precheck_reason(row, idxs, job.get('reason', ''), pce_fqdn)
                     if status in FINAL_STATES:
                         _compute_final_result(row, idxs)
+                        dissociate_puppet_module_from_server(sid, aid, token)
+                        change_server_puppet_environments(sid, 'stable', aid, token)
+                    elif args.max_retries is not None and retries_count >= args.max_retries:
+                        row[idxs['error']] = f"Max retries reached ({args.max_retries}) for job_id {job_id}"
+                        row[idxs['precheck_status']] = 'timeout'
                         dissociate_puppet_module_from_server(sid, aid, token)
                         change_server_puppet_environments(sid, 'stable', aid, token)
                     else:
