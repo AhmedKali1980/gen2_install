@@ -17,6 +17,21 @@ from config import PCE_LIST
 
 FINAL_STATES = {"failed", "success"}
 ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
+OSC_API_URL_CHOICES = ["PARIS", "NORTH", "AMER", "ASIA"]
+RESOLVED_OSC_API_URL = OSC_API_URL if isinstance(OSC_API_URL, str) else ""
+
+
+def _resolve_osc_api_url(osc_api_url_choice: str) -> str:
+    if isinstance(OSC_API_URL, dict):
+        value = OSC_API_URL.get(osc_api_url_choice)
+        if not value:
+            print(f"Error: OSC_API_URL missing key '{osc_api_url_choice}' in config.")
+            sys.exit(1)
+        return value
+    if osc_api_url_choice:
+        print("Error: --osc-api-url requires OSC_API_URL to be configured as a dict in config.py.")
+        sys.exit(1)
+    return OSC_API_URL
 
 
 def _read_csv_rows_with_auto_delimiter(input_path: str):
@@ -72,7 +87,7 @@ def create_output_csv_with_extra_columns(input_path: str) -> tuple[str, str]:
 
 def run_precheck_puppet_module(server_id: str, account_id: str, access_control_token) -> object:
     try:
-        url = f"{OSC_API_URL.rstrip('/')}/nodes/{server_id}/jobs/run-puppet"
+        url = f"{RESOLVED_OSC_API_URL.rstrip('/')}/nodes/{server_id}/jobs/run-puppet"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"{access_control_token.authorization_header}",
@@ -90,7 +105,7 @@ def run_precheck_puppet_module(server_id: str, account_id: str, access_control_t
 
 def associate_puppet_module_with_server(server_id: str, account_id: str, access_control_token) -> dict:
     try:
-        url = f"{OSC_API_URL.rstrip('/')}/nodes/{server_id}/modules"
+        url = f"{RESOLVED_OSC_API_URL.rstrip('/')}/nodes/{server_id}/modules"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"{access_control_token.authorization_header}",
@@ -107,7 +122,7 @@ def dissociate_puppet_module_from_server(server_id: str, account_id: str, access
     if not server_id:
         return
     try:
-        url = f"{OSC_API_URL.rstrip('/')}/nodes/{server_id}/modules/sg_illumio_ven::precheck"
+        url = f"{RESOLVED_OSC_API_URL.rstrip('/')}/nodes/{server_id}/modules/sg_illumio_ven::precheck"
         headers = {
             "Authorization": f"{access_control_token.authorization_header}",
             "X-Target-Account-Id": f"{account_id}"
@@ -119,7 +134,7 @@ def dissociate_puppet_module_from_server(server_id: str, account_id: str, access
 
 def change_server_puppet_environments(server_id: str, environment: str, account_id: str, access_control_token) -> dict:
     try:
-        url = f"{OSC_API_URL.rstrip('/')}/nodes/{server_id}/environments"
+        url = f"{RESOLVED_OSC_API_URL.rstrip('/')}/nodes/{server_id}/environments"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"{access_control_token.authorization_header}",
@@ -166,17 +181,20 @@ def _compute_final_result(row, idxs):
 
 
 def main():
+    global RESOLVED_OSC_API_URL
     parser = argparse.ArgumentParser(description="Run + monitor Gen2 prechecks from one CSV.")
     parser.add_argument('-f', '--file-path', type=str, required=True)
     parser.add_argument('--pce', type=str, choices=['dev', 'uat', 'prd', 'prd_critapps'], required=True)
     parser.add_argument('--osc-client-id', type=str, required=True)
     parser.add_argument('--osc-client-secret', type=str, required=False)
     parser.add_argument('--osc-account-id', type=str, required=True)
+    parser.add_argument('--osc-api-url', type=str, choices=OSC_API_URL_CHOICES, required=False)
     parser.add_argument('--batch-size', type=int, default=5)
     parser.add_argument('--poll-interval', type=int, default=20)
     parser.add_argument('--max-retries', type=int, default=None,
                         help="Max number of monitoring checks per job. If set, it overrides default infinite monitoring.")
     args = parser.parse_args()
+    RESOLVED_OSC_API_URL = _resolve_osc_api_url(args.osc_api_url)
 
     if not args.osc_client_secret:
         args.osc_client_secret = getpass(prompt='Osconfig Client secret: ')
@@ -230,7 +248,7 @@ def main():
                     sid, aid = row[idxs['server_id']], row[idxs['account_id']]
                     job_id = row[idxs['precheck_job_id']]
                     retries_count = int(row[idxs['precheck_retries']]) if row[idxs['precheck_retries']] else 0
-                    url = f"{OSC_API_URL.rstrip('/')}/jobs/{job_id}"
+                    url = f"{RESOLVED_OSC_API_URL.rstrip('/')}/jobs/{job_id}"
                     headers_req = {"Authorization": token.authorization_header, "X-Target-Account-Id": aid}
                     resp = requests.get(url, headers=headers_req)
                     retries_count += 1

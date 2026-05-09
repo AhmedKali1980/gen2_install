@@ -15,6 +15,21 @@ from config import OSC_API_URL
 from utils import get_pce_connection
 
 FINAL_STATES = {"failed", "success"}
+OSC_API_URL_CHOICES = ["PARIS", "NORTH", "AMER", "ASIA"]
+RESOLVED_OSC_API_URL = OSC_API_URL if isinstance(OSC_API_URL, str) else ""
+
+
+def _resolve_osc_api_url(osc_api_url_choice: str) -> str:
+    if isinstance(OSC_API_URL, dict):
+        value = OSC_API_URL.get(osc_api_url_choice)
+        if not value:
+            print(f"Error: OSC_API_URL missing key '{osc_api_url_choice}' in config.")
+            sys.exit(1)
+        return value
+    if osc_api_url_choice:
+        print("Error: --osc-api-url requires OSC_API_URL to be configured as a dict in config.py.")
+        sys.exit(1)
+    return OSC_API_URL
 
 
 def _read_csv_rows_with_auto_delimiter(input_path: str):
@@ -124,7 +139,7 @@ def get_osc_association_payload(pce: 'PolicyComputeEngine', pairing_profile_href
 
 def associate_module(server_id: str, account_id: str, payload: dict, token):
     try:
-        url = f"{OSC_API_URL.rstrip('/')}/nodes/{server_id}/modules"
+        url = f"{RESOLVED_OSC_API_URL.rstrip('/')}/nodes/{server_id}/modules"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"{token.authorization_header}",
@@ -138,7 +153,7 @@ def associate_module(server_id: str, account_id: str, payload: dict, token):
 
 def run_install(server_id: str, account_id: str, os_type: str, token):
     try:
-        url = f"{OSC_API_URL.rstrip('/')}/nodes/{server_id}/jobs/run-puppet"
+        url = f"{RESOLVED_OSC_API_URL.rstrip('/')}/nodes/{server_id}/jobs/run-puppet"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"{token.authorization_header}",
@@ -155,7 +170,7 @@ def run_install(server_id: str, account_id: str, os_type: str, token):
 
 
 def get_job_status(job_id: str, account_id: str, token):
-    url = f"{OSC_API_URL.rstrip('/')}/jobs/{job_id}"
+    url = f"{RESOLVED_OSC_API_URL.rstrip('/')}/jobs/{job_id}"
     headers = {"Authorization": token.authorization_header, "X-Target-Account-Id": account_id}
     response = requests.get(url, headers=headers)
     if response.status_code != 200:
@@ -165,7 +180,7 @@ def get_job_status(job_id: str, account_id: str, token):
 
 def dissociate_module(server_id: str, account_id: str, token):
     try:
-        url = f"{OSC_API_URL.rstrip('/')}/nodes/{server_id}/modules/sg_illumio_ven"
+        url = f"{RESOLVED_OSC_API_URL.rstrip('/')}/nodes/{server_id}/modules/sg_illumio_ven"
         headers = {"Authorization": token.authorization_header, "X-Target-Account-Id": account_id}
         response = requests.delete(url, headers=headers)
         return {} if response.status_code == 204 else {'error': f"{response.status_code}: {response.text}"}
@@ -182,6 +197,7 @@ def check_workload_in_pce(pce: 'PolicyComputeEngine', hostname: str, ip_address:
 
 
 def main():
+    global RESOLVED_OSC_API_URL
     parser = argparse.ArgumentParser(description="Bulk install + monitor Illumio agents by batches of 5.")
     parser.add_argument('-f', '--file-path', type=str, required=True)
     parser.add_argument('--pce', type=str, choices=['dev', 'uat', 'prd', 'prd_critapps'], required=True)
@@ -192,6 +208,7 @@ def main():
     parser.add_argument('--osc-client-id', type=str, required=True)
     parser.add_argument('--osc-client-secret', type=str, required=False)
     parser.add_argument('--osc-account-id', type=str, required=True)
+    parser.add_argument('--osc-api-url', type=str, choices=OSC_API_URL_CHOICES, required=False)
     parser.add_argument('--batch-size', type=int, default=5)
     parser.add_argument('--poll-interval', type=int, default=20)
     parser.add_argument('--force-profile-id', type=int, required=False,
@@ -199,6 +216,7 @@ def main():
     parser.add_argument('--force-ac', type=str, required=False,
                         help='Force pairing key (ac) in OSC payload and skip pairing key generation on PCE (must be used with --force-profile-id)')
     args = parser.parse_args()
+    RESOLVED_OSC_API_URL = _resolve_osc_api_url(args.osc_api_url)
 
     forced_mode = args.force_profile_id is not None or bool(args.force_ac)
     if forced_mode and not (args.force_profile_id is not None and bool(args.force_ac)):
