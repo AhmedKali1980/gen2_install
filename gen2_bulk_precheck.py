@@ -217,32 +217,43 @@ def main():
         batch = data_rows[start:start + args.batch_size]
         batch_no = start // args.batch_size + 1
         processed_count = min(start + len(batch), total_servers)
-        print(f"\n[Batch {batch_no}] Launch prechecks for {len(batch)} servers ({processed_count}/{total_servers})...")
+        print(f"\n=== Batch {batch_no} | servers {start + 1}-{start + len(batch)} / {total_servers} ===")
         running = []
+        status_tracker = {}
         with acl_token_generator.generate() as token:
             for row in batch:
                 sid = row[idxs['server_id']]
                 aid = row[idxs['account_id']]
-                print(f"  -> {sid}: switch env unstable + associate module + launch job")
-                for res in (
-                    change_server_puppet_environments(sid, "unstable", aid, token),
-                    associate_puppet_module_with_server(sid, aid, token),
-                ):
-                    if 'error' in res:
-                        row[idxs['error']] = res['error']
-                        break
+                print(f"[START] server={sid} account={aid}")
+
+                env_change = change_server_puppet_environments(sid, "unstable", aid, token)
+                if 'error' in env_change:
+                    row[idxs['error']] = env_change['error']
+                    print(f"  [ERROR] env unstable server={sid}: {row[idxs['error']]}")
+                    continue
+                print(f"  [OK] env=unstable server={sid}")
+
+                assoc = associate_puppet_module_with_server(sid, aid, token)
+                if 'error' in assoc:
+                    row[idxs['error']] = assoc['error']
+                    print(f"  [ERROR] module association server={sid}: {row[idxs['error']]}")
+                    continue
+                print(f"  [OK] module associated server={sid} module=sg_illumio_ven::precheck")
+
                 if row[idxs['error']]:
                     continue
                 precheck = run_precheck_puppet_module(sid, aid, token)
                 if isinstance(precheck, dict):
                     row[idxs['error']] = precheck['error']
+                    print(f"  [ERROR] launch precheck server={sid}: {row[idxs['error']]}")
                     continue
                 row[idxs['precheck_job_id']] = precheck
                 row[idxs['precheck_status']] = 'running'
                 running.append(row)
+                print(f"  [OK] job launched server={sid} job_id={precheck}")
 
             while running:
-                print(f"  Monitoring {len(running)} running jobs...")
+                print(f"[MONITOR] {len(running)} precheck job(s) running...")
                 remaining = []
                 for row in running:
                     sid, aid = row[idxs['server_id']], row[idxs['account_id']]
@@ -256,21 +267,51 @@ def main():
                     if resp.status_code != 200:
                         row[idxs['error']] = f"{resp.status_code}: {resp.text}"
                         row[idxs['precheck_status']] = 'error'
+                        print(f"  [ERROR] server={sid} job={job_id}: {row[idxs['error']]}")
                         continue
                     job = resp.json().get('job', {})
                     status = (job.get('status') or '').lower()
                     row[idxs['precheck_status']] = status
-                    print(f"    - {sid}: {status}")
-                    _parse_precheck_reason(row, idxs, job.get('reason', ''), pce_fqdn)
+                    created_at = job.get('createdAt') or job.get('created_at') or '-'
+                    updated_at = job.get('updatedAt') or job.get('updated_at') or '-'
+                    message = (job.get('message') or '').strip()
+                    reason = (job.get('reason') or '').strip()
+                    print(f"  [STATUS] server={sid} job={job_id} -> {status} (retry={retries_count})")
+                    _parse_precheck_reason(row, idxs, reason, pce_fqdn)
+
+                    previous_status, same_status_count = status_tracker.get(job_id, ("", 0))
+                    if status == previous_status:
+                        same_status_count += 1
+                    else:
+                        same_status_count = 1
+                    status_tracker[job_id] = (status, same_status_count)
+
+                    if message:
+                        print(f"    [JOB_MESSAGE] server={sid} job={job_id}: {message}")
+                    if status == "running" and (retries_count % 5 == 0 or same_status_count >= 5):
+                        print(
+                            f"    [RUNNING_DIAG] server={sid} job={job_id} still running | "
+                            f"created_at={created_at} updated_at={updated_at} same_status_count={same_status_count}"
+                        )
+                        if reason:
+                            print(f"    [RUNNING_REASON] server={sid} job={job_id}: {reason}")
                     if status in FINAL_STATES:
                         _compute_final_result(row, idxs)
                         dissociate_puppet_module_from_server(sid, aid, token)
-                        change_server_puppet_environments(sid, 'stable', aid, token)
+                        print(f"  [CLEANUP] module dissociated server={sid}")
+                        env_back = change_server_puppet_environments(sid, 'stable', aid, token)
+                        if 'error' in env_back:
+                            print(f"  [WARN] env stable failed server={sid}: {env_back['error']}")
+                        else:
+                            print(f"  [CLEANUP] env=stable server={sid}")
                     elif args.max_retries is not None and retries_count >= args.max_retries:
                         row[idxs['error']] = f"Max retries reached ({args.max_retries}) for job_id {job_id}"
                         row[idxs['precheck_status']] = 'timeout'
                         dissociate_puppet_module_from_server(sid, aid, token)
-                        change_server_puppet_environments(sid, 'stable', aid, token)
+                        print(f"  [TIMEOUT] server={sid} job={job_id}")
+                        env_back = change_server_puppet_environments(sid, 'stable', aid, token)
+                        if 'error' in env_back:
+                            print(f"  [WARN] env stable failed server={sid}: {env_back['error']}")
                     else:
                         remaining.append(row)
                 running = remaining
