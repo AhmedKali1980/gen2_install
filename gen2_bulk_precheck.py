@@ -219,6 +219,7 @@ def main():
         processed_count = min(start + len(batch), total_servers)
         print(f"\n=== Batch {batch_no} | servers {start + 1}-{start + len(batch)} / {total_servers} ===")
         running = []
+        status_tracker = {}
         with acl_token_generator.generate() as token:
             for row in batch:
                 sid = row[idxs['server_id']]
@@ -271,8 +272,29 @@ def main():
                     job = resp.json().get('job', {})
                     status = (job.get('status') or '').lower()
                     row[idxs['precheck_status']] = status
+                    created_at = job.get('createdAt') or job.get('created_at') or '-'
+                    updated_at = job.get('updatedAt') or job.get('updated_at') or '-'
+                    message = (job.get('message') or '').strip()
+                    reason = (job.get('reason') or '').strip()
                     print(f"  [STATUS] server={sid} job={job_id} -> {status} (retry={retries_count})")
-                    _parse_precheck_reason(row, idxs, job.get('reason', ''), pce_fqdn)
+                    _parse_precheck_reason(row, idxs, reason, pce_fqdn)
+
+                    previous_status, same_status_count = status_tracker.get(job_id, ("", 0))
+                    if status == previous_status:
+                        same_status_count += 1
+                    else:
+                        same_status_count = 1
+                    status_tracker[job_id] = (status, same_status_count)
+
+                    if message:
+                        print(f"    [JOB_MESSAGE] server={sid} job={job_id}: {message}")
+                    if status == "running" and (retries_count % 5 == 0 or same_status_count >= 5):
+                        print(
+                            f"    [RUNNING_DIAG] server={sid} job={job_id} still running | "
+                            f"created_at={created_at} updated_at={updated_at} same_status_count={same_status_count}"
+                        )
+                        if reason:
+                            print(f"    [RUNNING_REASON] server={sid} job={job_id}: {reason}")
                     if status in FINAL_STATES:
                         _compute_final_result(row, idxs)
                         dissociate_puppet_module_from_server(sid, aid, token)
