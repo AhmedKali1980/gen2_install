@@ -193,6 +193,8 @@ def main():
     parser.add_argument('--poll-interval', type=int, default=20)
     parser.add_argument('--max-retries', type=int, default=None,
                         help="Max number of monitoring checks per job. If set, it overrides default infinite monitoring.")
+    parser.add_argument('--skip-unstable-switch', action='store_true',
+                        help="Skip switching puppet environment to unstable/stable during precheck.")
     args = parser.parse_args()
     RESOLVED_OSC_API_URL = _resolve_osc_api_url(args.osc_api_url)
 
@@ -224,22 +226,17 @@ def main():
             for row in batch:
                 sid = row[idxs['server_id']]
                 aid = row[idxs['account_id']]
-                print(f"[START] server={sid} account={aid}")
-
-                env_change = change_server_puppet_environments(sid, "unstable", aid, token)
-                if 'error' in env_change:
-                    row[idxs['error']] = env_change['error']
-                    print(f"  [ERROR] env unstable server={sid}: {row[idxs['error']]}")
+                print(f"  -> {sid}: associate module + launch job")
+                if not args.skip_unstable_switch:
+                    print(f"     switching {sid} puppet env to unstable")
+                    res = change_server_puppet_environments(sid, "unstable", aid, token)
+                    if 'error' in res:
+                        row[idxs['error']] = res['error']
+                        continue
+                res = associate_puppet_module_with_server(sid, aid, token)
+                if 'error' in res:
+                    row[idxs['error']] = res['error']
                     continue
-                print(f"  [OK] env=unstable server={sid}")
-
-                assoc = associate_puppet_module_with_server(sid, aid, token)
-                if 'error' in assoc:
-                    row[idxs['error']] = assoc['error']
-                    print(f"  [ERROR] module association server={sid}: {row[idxs['error']]}")
-                    continue
-                print(f"  [OK] module associated server={sid} module=sg_illumio_ven::precheck")
-
                 if row[idxs['error']]:
                     continue
                 precheck = run_precheck_puppet_module(sid, aid, token)
@@ -298,20 +295,14 @@ def main():
                     if status in FINAL_STATES:
                         _compute_final_result(row, idxs)
                         dissociate_puppet_module_from_server(sid, aid, token)
-                        print(f"  [CLEANUP] module dissociated server={sid}")
-                        env_back = change_server_puppet_environments(sid, 'stable', aid, token)
-                        if 'error' in env_back:
-                            print(f"  [WARN] env stable failed server={sid}: {env_back['error']}")
-                        else:
-                            print(f"  [CLEANUP] env=stable server={sid}")
+                        if not args.skip_unstable_switch:
+                            change_server_puppet_environments(sid, 'stable', aid, token)
                     elif args.max_retries is not None and retries_count >= args.max_retries:
                         row[idxs['error']] = f"Max retries reached ({args.max_retries}) for job_id {job_id}"
                         row[idxs['precheck_status']] = 'timeout'
                         dissociate_puppet_module_from_server(sid, aid, token)
-                        print(f"  [TIMEOUT] server={sid} job={job_id}")
-                        env_back = change_server_puppet_environments(sid, 'stable', aid, token)
-                        if 'error' in env_back:
-                            print(f"  [WARN] env stable failed server={sid}: {env_back['error']}")
+                        if not args.skip_unstable_switch:
+                            change_server_puppet_environments(sid, 'stable', aid, token)
                     else:
                         remaining.append(row)
                 running = remaining
