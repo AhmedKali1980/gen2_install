@@ -10,6 +10,7 @@ from time import sleep
 
 import requests
 from openpyxl import Workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from illumio import PairingProfile, PolicyComputeEngine  # type: ignore
 from sg_iamaas import CachingTokenGenerator
 
@@ -59,11 +60,20 @@ def _write_xlsx_output(output_csv_path: str, delimiter: str, result_column: str)
         if status_idx is not None and status_idx < len(row):
             status_value = row[status_idx]
         operation_result = "OK" if str(status_value).lower() in ("success", "ok") else "KO"
-        ws.append(row + ["", "", operation_result])
+        safe_row = [_sanitize_xlsx_cell_value(v) for v in (row + ["", "", operation_result])]
+        ws.append(safe_row)
 
     xlsx_path = _build_xlsx_output_path(output_csv_path)
     wb.save(xlsx_path)
     return xlsx_path
+
+
+def _sanitize_xlsx_cell_value(value):
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return value
+    return ILLEGAL_CHARACTERS_RE.sub("", value)
 
 
 class OscTokenManager:
