@@ -135,17 +135,18 @@ def _read_csv_rows_with_auto_delimiter(input_path: str):
         sys.exit(1)
 
 
-def create_output_csv_with_extra_columns(input_path: str, pce_name: str) -> tuple[str, str]:
+def create_output_csv_with_extra_columns(input_path: str, pce_name: str, forced_mode: bool) -> tuple[str, str]:
     input_dir = os.path.dirname(input_path)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_filename = f"{timestamp}_{pce_name}_gen2_bulk_install_result.csv"
     output_path = os.path.join(input_dir, output_filename)
 
-    required_columns = [
-        "server_id", "account_id", "pairing_profile_name", "application_label_href",
-        "env_label_href", "location_label_href", "role_label_href", "os_label_href",
-        "enforcement_mode"
-    ]
+    required_columns = ["server_id", "account_id"]
+    if not forced_mode:
+        required_columns.extend([
+            "pairing_profile_name", "application_label_href", "env_label_href",
+            "location_label_href", "role_label_href", "enforcement_mode"
+        ])
     rows, delimiter = _read_csv_rows_with_auto_delimiter(input_path)
     if not rows:
         print("Error: Input CSV is empty.")
@@ -305,6 +306,14 @@ def check_workload_in_pce(pce: 'PolicyComputeEngine', hostname: str, ip_address:
         return False
 
 
+def _detect_os_type(row: list, idx: dict) -> str:
+    os_name = row[idx['OS']].strip() if 'OS' in idx else ''
+    pairing_profile_name = row[idx['pairing_profile_name']].strip() if 'pairing_profile_name' in idx else ''
+    os_label_href = row[idx['os_label_href']].strip() if 'os_label_href' in idx else ''
+    fingerprint = f"{os_name} {pairing_profile_name} {os_label_href}".lower()
+    return "windows" if "windows" in fingerprint else "linux"
+
+
 def main():
     global RESOLVED_OSC_API_URL
     parser = argparse.ArgumentParser(description="Bulk install + monitor Illumio agents by batches of 5.")
@@ -349,7 +358,7 @@ def main():
         if not args.osc_client_secret:
             args.osc_client_secret = getpass(prompt='Osconfig Client secret: ')
 
-        output_csv, delimiter = create_output_csv_with_extra_columns(args.file_path, args.pce)
+        output_csv, delimiter = create_output_csv_with_extra_columns(args.file_path, args.pce, forced_mode)
         pce = None
         if not forced_mode:
             pce = get_pce_connection(args.pce, args.pce_username, args.pce_password)
@@ -373,21 +382,21 @@ def main():
                 for row in batch:
                     server_id = row[idx['server_id']]
                     account_id = row[idx['account_id']]
-                    profile_name = row[idx['pairing_profile_name']]
-                    enforcement_mode = row[idx['enforcement_mode']]
+                    profile_name = row[idx['pairing_profile_name']] if 'pairing_profile_name' in idx else ''
+                    enforcement_mode = row[idx['enforcement_mode']] if 'enforcement_mode' in idx else ''
                     print(f"[START] server={server_id} account={account_id} profile={profile_name}")
 
-                    labels = [
-                        {"href": row[idx["role_label_href"]]},
-                        {"href": row[idx["application_label_href"]]},
-                        {"href": row[idx["env_label_href"]]},
-                        {"href": row[idx["location_label_href"]]},
-                        {"href": row[idx["os_label_href"]]},
-                    ]
                     if forced_mode:
                         payload = build_osc_association_payload(args.force_profile_id, args.force_ac, args.pce)
                         print(f"  [FORCED] profile_id={args.force_profile_id} ac=<provided>")
                     else:
+                        labels = [
+                            {"href": row[idx["role_label_href"]]},
+                            {"href": row[idx["application_label_href"]]},
+                            {"href": row[idx["env_label_href"]]},
+                            {"href": row[idx["location_label_href"]]},
+                            {"href": row[idx["os_label_href"]]},
+                        ]
                         profile = get_or_create_pairing_profile(pce, profile_name, enforcement_mode, labels, profile_cache)
                         if isinstance(profile, dict):
                             row[idx['error']] = profile['error']
@@ -406,7 +415,7 @@ def main():
                         print(f"  [ERROR] association: {row[idx['error']]}")
                         continue
 
-                    os_type = "windows" if profile_name.lower().endswith("windows") else "linux"
+                    os_type = _detect_os_type(row, idx)
                     job_res = run_install(server_id, account_id, os_type, token_manager)
                     if isinstance(job_res, dict):
                         row[idx['error']] = job_res['error']
