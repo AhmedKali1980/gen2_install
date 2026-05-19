@@ -181,14 +181,14 @@ def create_output_csv_with_extra_columns(input_path: str) -> tuple[str, str]:
     return output_path, delimiter
 
 
-def run_precheck_puppet_module(server_id: str, account_id: str, token_manager: OscTokenManager) -> object:
+def run_precheck_puppet_module(server_id: str, account_id: str, token_manager: OscTokenManager, module_name: str) -> object:
     try:
         url = f"{RESOLVED_OSC_API_URL.rstrip('/')}/nodes/{server_id}/jobs/run-puppet"
         headers = {
             "Content-Type": "application/json",
                         "X-Target-Account-Id": f"{account_id}"
         }
-        payload = {"osType": "linux", "skipTags": [], "tags": ["sg_illumio_ven::precheck_output"]}
+        payload = {"osType": "linux", "skipTags": [], "tags": [module_name]}
         response = request_with_token_refresh(
             token_manager,
             lambda token: requests.post(
@@ -365,20 +365,22 @@ def main():
                         continue
                     if row[idxs['error']]:
                         continue
-                    precheck = run_precheck_puppet_module(sid, aid, token_manager)
+                    precheck = run_precheck_puppet_module(sid, aid, token_manager, "sg_illumio_ven::precheck")
                     if isinstance(precheck, dict):
                         row[idxs['error']] = precheck['error']
                         print(f"  [ERROR] launch precheck server={sid}: {row[idxs['error']]}")
                         continue
                     row[idxs['precheck_job_id']] = precheck
-                    row[idxs['precheck_status']] = 'running'
-                    running.append(row)
-                    print(f"  [OK] job launched server={sid} job_id={precheck}")
+                    row[idxs['precheck_status']] = 'running_precheck'
+                    running.append({'row': row, 'phase': 'precheck'})
+                    print(f"  [OK] precheck job launched server={sid} job_id={precheck}")
 
                 while running:
                     print(f"[MONITOR] {len(running)} precheck job(s) running...")
                     remaining = []
-                    for row in running:
+                    for item in running:
+                        row = item['row']
+                        phase = item.get('phase', 'precheck_output')
                         sid, aid = row[idxs['server_id']], row[idxs['account_id']]
                         job_id = row[idxs['precheck_job_id']]
                         retries_count = int(row[idxs['precheck_retries']]) if row[idxs['precheck_retries']] else 0
@@ -396,6 +398,9 @@ def main():
                             row[idxs['error']] = f"{resp.status_code}: {resp.text}"
                             row[idxs['precheck_status']] = 'error'
                             print(f"  [ERROR] server={sid} job={job_id}: {row[idxs['error']]}")
+                            dissociate_puppet_module_from_server(sid, aid, token_manager)
+                            if not args.skip_unstable_switch:
+                                change_server_puppet_environments(sid, 'stable', aid, token_manager)
                             continue
                         job = resp.json().get('job', {})
                         status = (job.get('status') or '').lower()
@@ -404,8 +409,9 @@ def main():
                         updated_at = job.get('updatedAt') or job.get('updated_at') or '-'
                         message = (job.get('message') or '').strip()
                         reason = (job.get('reason') or '').strip()
-                        print(f"  [STATUS] server={sid} job={job_id} -> {status} (retry={retries_count})")
-                        _parse_precheck_reason(row, idxs, reason, pce_fqdn)
+                        print(f"  [STATUS] server={sid} phase={phase} job={job_id} -> {status} (retry={retries_count})")
+                        if phase == "precheck_output":
+                            _parse_precheck_reason(row, idxs, reason, pce_fqdn)
 
                         previous_status, same_status_count = status_tracker.get(job_id, ("", 0))
                         same_status_count = same_status_count + 1 if status == previous_status else 1
@@ -418,10 +424,33 @@ def main():
                             if reason:
                                 print(f"    [RUNNING_REASON] server={sid} job={job_id}: {reason}")
                         if status in FINAL_STATES:
-                            _compute_final_result(row, idxs)
-                            dissociate_puppet_module_from_server(sid, aid, token_manager)
-                            if not args.skip_unstable_switch:
-                                change_server_puppet_environments(sid, 'stable', aid, token_manager)
+                            if phase == "precheck":
+                                if status == "success":
+                                    output_job = run_precheck_puppet_module(sid, aid, token_manager, "sg_illumio_ven::precheck_output")
+                                    if isinstance(output_job, dict):
+                                        row[idxs['error']] = output_job['error']
+                                        row[idxs['precheck_status']] = 'error'
+                                        print(f"  [ERROR] launch precheck_output server={sid}: {row[idxs['error']]}")
+                                        dissociate_puppet_module_from_server(sid, aid, token_manager)
+                                        if not args.skip_unstable_switch:
+                                            change_server_puppet_environments(sid, 'stable', aid, token_manager)
+                                    else:
+                                        row[idxs['precheck_job_id']] = output_job
+                                        row[idxs['precheck_status']] = 'running_precheck_output'
+                                        row[idxs['precheck_retries']] = '0'
+                                        status_tracker[output_job] = ("", 0)
+                                        remaining.append({'row': row, 'phase': 'precheck_output'})
+                                        print(f"  [OK] precheck_output job launched server={sid} job_id={output_job}")
+                                else:
+                                    _compute_final_result(row, idxs)
+                                    dissociate_puppet_module_from_server(sid, aid, token_manager)
+                                    if not args.skip_unstable_switch:
+                                        change_server_puppet_environments(sid, 'stable', aid, token_manager)
+                            else:
+                                _compute_final_result(row, idxs)
+                                dissociate_puppet_module_from_server(sid, aid, token_manager)
+                                if not args.skip_unstable_switch:
+                                    change_server_puppet_environments(sid, 'stable', aid, token_manager)
                         elif args.max_retries is not None and retries_count >= args.max_retries:
                             row[idxs['error']] = f"Max retries reached ({args.max_retries}) for job_id {job_id}"
                             row[idxs['precheck_status']] = 'timeout'
@@ -429,7 +458,7 @@ def main():
                             if not args.skip_unstable_switch:
                                 change_server_puppet_environments(sid, 'stable', aid, token_manager)
                         else:
-                            remaining.append(row)
+                            remaining.append({'row': row, 'phase': phase})
                     running = remaining
                     if running:
                         sleep(args.poll_interval)
