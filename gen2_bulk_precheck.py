@@ -169,14 +169,14 @@ def create_output_csv_with_extra_columns(input_path: str) -> tuple[str, str]:
         "error", "precheck_job_id", "precheck_status", "1_os_check", "2_disk_space",
         "3_dns_resolution", "4_ping", "5_port_access", "6_docker_chain",
         "7_docker_ruleset", "8_podman", "9_podman_network", "10_podman_docker_cli",
-        "11_nat_iptable", "12_nat_nftable", "precheck_result", "precheck_retries"
+        "11_nat_iptable", "12_nat_nftable", "precheck_result", "precheck_retries", "precheck_reason"
     ]
 
     with open(output_path, 'w', newline='', encoding='utf-8') as outfile:
         writer = csv.writer(outfile, delimiter=delimiter)
         writer.writerow(headers)
         for row in rows[1:]:
-            writer.writerow(row + [""] * 17)
+            writer.writerow(row + [""] * 18)
 
     return output_path, delimiter
 
@@ -409,6 +409,7 @@ def main():
                         updated_at = job.get('updatedAt') or job.get('updated_at') or '-'
                         message = (job.get('message') or '').strip()
                         reason = (job.get('reason') or '').strip()
+                        row[idxs['precheck_reason']] = reason
                         print(f"  [STATUS] server={sid} phase={phase} job={job_id} -> {status} (retry={retries_count})")
                         if phase == "precheck_output":
                             _parse_precheck_reason(row, idxs, reason, pce_fqdn)
