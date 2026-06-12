@@ -21,6 +21,7 @@ from config import PCE_LIST
 FINAL_STATES = {"failed", "success"}
 ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
 OSC_API_URL_CHOICES = ["PARIS", "NORTH", "AMER", "ASIA"]
+OSC_API_URL_CSV_COLUMN = "osc_api_url"
 RESOLVED_OSC_API_URL = OSC_API_URL if isinstance(OSC_API_URL, str) else ""
 
 
@@ -117,17 +118,27 @@ def request_with_token_refresh(token_manager: OscTokenManager, request_fn):
     return response
 
 
-def _resolve_osc_api_url(osc_api_url_choice: str) -> str:
+def _resolve_osc_api_url(osc_api_url_choice: str, source: str = OSC_API_URL_CSV_COLUMN) -> str:
+    osc_api_url_choice = (osc_api_url_choice or "").strip()
     if isinstance(OSC_API_URL, dict):
         value = OSC_API_URL.get(osc_api_url_choice)
         if not value:
-            print(f"Error: OSC_API_URL missing key '{osc_api_url_choice}' in config.")
+            allowed = ", ".join(OSC_API_URL.keys())
+            print(
+                f"Error: {source} value '{osc_api_url_choice}' is not configured in OSC_API_URL. "
+                f"Expected one of: {allowed}."
+            )
             sys.exit(1)
         return value
     if osc_api_url_choice:
-        print("Error: --osc-api-url requires OSC_API_URL to be configured as a dict in config.py.")
+        print(f"Error: {source} can only be used when OSC_API_URL is configured as a dict in config.py.")
         sys.exit(1)
     return OSC_API_URL
+
+
+def _set_resolved_osc_api_url_from_row(row: list, idxs: dict) -> None:
+    global RESOLVED_OSC_API_URL
+    RESOLVED_OSC_API_URL = _resolve_osc_api_url(row[idxs[OSC_API_URL_CSV_COLUMN]])
 
 
 def _read_csv_rows_with_auto_delimiter(input_path: str):
@@ -147,13 +158,13 @@ def _read_csv_rows_with_auto_delimiter(input_path: str):
         sys.exit(1)
 
 
-def create_output_csv_with_extra_columns(input_path: str) -> tuple[str, str]:
+def create_output_csv_with_extra_columns(input_path: str, include_reason: bool) -> tuple[str, str]:
     input_dir = os.path.dirname(input_path)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_filename = f"{timestamp}_gen2_precheck_result.csv"
     output_path = os.path.join(input_dir, output_filename)
 
-    required_columns = ["server_id", "account_id"]
+    required_columns = ["server_id", "account_id", OSC_API_URL_CSV_COLUMN]
     rows, delimiter = _read_csv_rows_with_auto_delimiter(input_path)
     if not rows:
         print("Error: Input CSV is empty.")
@@ -165,18 +176,21 @@ def create_output_csv_with_extra_columns(input_path: str) -> tuple[str, str]:
             print(f"Error: Input CSV missing required column '{col}'.")
             sys.exit(1)
 
-    headers = rows[0] + [
+    extra_columns = [
         "error", "precheck_job_id", "precheck_status", "1_os_check", "2_disk_space",
         "3_dns_resolution", "4_ping", "5_port_access", "6_docker_chain",
         "7_docker_ruleset", "8_podman", "9_podman_network", "10_podman_docker_cli",
-        "11_nat_iptable", "12_nat_nftable", "precheck_result", "precheck_retries", "precheck_reason"
+        "11_nat_iptable", "12_nat_nftable", "precheck_result", "precheck_retries"
     ]
+    if include_reason:
+        extra_columns.append("precheck_reason")
+    headers = rows[0] + extra_columns
 
     with open(output_path, 'w', newline='', encoding='utf-8') as outfile:
         writer = csv.writer(outfile, delimiter=delimiter)
         writer.writerow(headers)
         for row in rows[1:]:
-            writer.writerow(row + [""] * 18)
+            writer.writerow(row + [""] * len(extra_columns))
 
     return output_path, delimiter
 
@@ -300,20 +314,28 @@ def _compute_final_result(row, idxs):
 
 
 def main():
-    global RESOLVED_OSC_API_URL
-    parser = argparse.ArgumentParser(description="Run + monitor Gen2 prechecks from one CSV.")
-    parser.add_argument('-f', '--file-path', type=str, required=True)
+    parser = argparse.ArgumentParser(
+        description="Run + monitor Gen2 prechecks from one CSV.",
+        epilog=f"Input CSV must include: server_id, account_id, {OSC_API_URL_CSV_COLUMN}. "
+               f"When OSC_API_URL is a dict, {OSC_API_URL_CSV_COLUMN} must be one of: "
+               f"{', '.join(OSC_API_URL_CHOICES)}."
+    )
+    parser.add_argument(
+        '-f', '--file-path', type=str, required=True,
+        help=f"Input CSV path. Required columns: server_id, account_id, {OSC_API_URL_CSV_COLUMN}."
+    )
     parser.add_argument('--pce', type=str, choices=['dev', 'uat', 'prd', 'prd_critapps'], required=True)
     parser.add_argument('--osc-client-id', type=str, required=True)
     parser.add_argument('--osc-client-secret', type=str, required=False)
     parser.add_argument('--osc-account-id', type=str, required=True)
-    parser.add_argument('--osc-api-url', type=str, choices=OSC_API_URL_CHOICES, required=False)
     parser.add_argument('--batch-size', type=int, default=5)
     parser.add_argument('--poll-interval', type=int, default=20)
     parser.add_argument('--max-retries', type=int, default=None,
                         help="Max number of monitoring checks per job. If set, it overrides default infinite monitoring.")
-    parser.add_argument('--skip-unstable-switch', action='store_true',
-                        help="Skip switching puppet environment to unstable/stable during precheck.")
+    parser.add_argument('--show-reason', action='store_true',
+                        help="Print the raw Puppet job reason and include it in result CSV/XLSX files.")
+    parser.add_argument('--switch-unstable', action='store_true',
+                        help="Switch each server puppet environment to unstable before precheck, then back to stable after processing. By default, no environment switch is performed.")
     args = parser.parse_args()
 
     original_stdout = sys.stdout
@@ -324,11 +346,10 @@ def main():
         sys.stdout = TeeStdout(original_stdout, log_file)
         print(f"[LOG] Output is also written to: {log_path}")
 
-        RESOLVED_OSC_API_URL = _resolve_osc_api_url(args.osc_api_url)
         if not args.osc_client_secret:
             args.osc_client_secret = getpass(prompt='Osconfig Client secret: ')
 
-        output_csv, delimiter = create_output_csv_with_extra_columns(args.file_path)
+        output_csv, delimiter = create_output_csv_with_extra_columns(args.file_path, args.show_reason)
         rows, _ = _read_csv_rows_with_auto_delimiter(output_csv)
         headers, data_rows = rows[0], rows[1:]
         idxs = {h.strip().lstrip('*').strip(): i for i, h in enumerate(headers)}
@@ -350,10 +371,11 @@ def main():
             status_tracker = {}
             with OscTokenManager(acl_token_generator) as token_manager:
                 for row in batch:
+                    _set_resolved_osc_api_url_from_row(row, idxs)
                     sid = row[idxs['server_id']]
                     aid = row[idxs['account_id']]
                     print(f"  -> {sid}: associate module + launch job")
-                    if not args.skip_unstable_switch:
+                    if args.switch_unstable:
                         print(f"     switching {sid} puppet env to unstable")
                         res = change_server_puppet_environments(sid, "unstable", aid, token_manager)
                         if 'error' in res:
@@ -381,6 +403,7 @@ def main():
                     for item in running:
                         row = item['row']
                         phase = item.get('phase', 'precheck_output')
+                        _set_resolved_osc_api_url_from_row(row, idxs)
                         sid, aid = row[idxs['server_id']], row[idxs['account_id']]
                         job_id = row[idxs['precheck_job_id']]
                         retries_count = int(row[idxs['precheck_retries']]) if row[idxs['precheck_retries']] else 0
@@ -399,7 +422,7 @@ def main():
                             row[idxs['precheck_status']] = 'error'
                             print(f"  [ERROR] server={sid} job={job_id}: {row[idxs['error']]}")
                             dissociate_puppet_module_from_server(sid, aid, token_manager)
-                            if not args.skip_unstable_switch:
+                            if args.switch_unstable:
                                 change_server_puppet_environments(sid, 'stable', aid, token_manager)
                             continue
                         job = resp.json().get('job', {})
@@ -409,7 +432,8 @@ def main():
                         updated_at = job.get('updatedAt') or job.get('updated_at') or '-'
                         message = (job.get('message') or '').strip()
                         reason = (job.get('reason') or '').strip()
-                        row[idxs['precheck_reason']] = reason
+                        if args.show_reason:
+                            row[idxs['precheck_reason']] = reason
                         print(f"  [STATUS] server={sid} phase={phase} job={job_id} -> {status} (retry={retries_count})")
                         if phase == "precheck_output":
                             _parse_precheck_reason(row, idxs, reason, pce_fqdn)
@@ -420,10 +444,10 @@ def main():
 
                         if message:
                             print(f"    [JOB_MESSAGE] server={sid} job={job_id}: {message}")
+                        if args.show_reason and reason:
+                            print(f"    [JOB_REASON] server={sid} job={job_id}: {reason}")
                         if status == "running" and (retries_count % 5 == 0 or same_status_count >= 5):
                             print(f"    [RUNNING_DIAG] server={sid} job={job_id} still running | created_at={created_at} updated_at={updated_at} same_status_count={same_status_count}")
-                            if reason:
-                                print(f"    [RUNNING_REASON] server={sid} job={job_id}: {reason}")
                         if status in FINAL_STATES:
                             if phase == "precheck":
                                 if status == "success":
@@ -433,7 +457,7 @@ def main():
                                         row[idxs['precheck_status']] = 'error'
                                         print(f"  [ERROR] launch precheck_output server={sid}: {row[idxs['error']]}")
                                         dissociate_puppet_module_from_server(sid, aid, token_manager)
-                                        if not args.skip_unstable_switch:
+                                        if args.switch_unstable:
                                             change_server_puppet_environments(sid, 'stable', aid, token_manager)
                                     else:
                                         row[idxs['precheck_job_id']] = output_job
@@ -445,18 +469,18 @@ def main():
                                 else:
                                     _compute_final_result(row, idxs)
                                     dissociate_puppet_module_from_server(sid, aid, token_manager)
-                                    if not args.skip_unstable_switch:
+                                    if args.switch_unstable:
                                         change_server_puppet_environments(sid, 'stable', aid, token_manager)
                             else:
                                 _compute_final_result(row, idxs)
                                 dissociate_puppet_module_from_server(sid, aid, token_manager)
-                                if not args.skip_unstable_switch:
+                                if args.switch_unstable:
                                     change_server_puppet_environments(sid, 'stable', aid, token_manager)
                         elif args.max_retries is not None and retries_count >= args.max_retries:
                             row[idxs['error']] = f"Max retries reached ({args.max_retries}) for job_id {job_id}"
                             row[idxs['precheck_status']] = 'timeout'
                             dissociate_puppet_module_from_server(sid, aid, token_manager)
-                            if not args.skip_unstable_switch:
+                            if args.switch_unstable:
                                 change_server_puppet_environments(sid, 'stable', aid, token_manager)
                         else:
                             remaining.append({'row': row, 'phase': phase})
@@ -466,6 +490,7 @@ def main():
 
                 print(f"  Cleanup batch {batch_no}: dissociate module for processed servers...")
                 for row in batch:
+                    _set_resolved_osc_api_url_from_row(row, idxs)
                     sid = row[idxs['server_id']]
                     aid = row[idxs['account_id']]
                     dissociate_puppet_module_from_server(sid, aid, token_manager)
