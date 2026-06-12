@@ -19,6 +19,8 @@ from utils import get_pce_connection
 
 FINAL_STATES = {"failed", "success"}
 OSC_API_URL_CHOICES = ["PARIS", "NORTH", "AMER", "ASIA"]
+OSC_API_URL_CSV_COLUMN = "osc_api_url"
+PUPPET_PARAM_CSV_COLUMNS = ["role", "app", "ilm_env", "loc", "enforcement_mode"]
 RESOLVED_OSC_API_URL = OSC_API_URL if isinstance(OSC_API_URL, str) else ""
 
 
@@ -115,17 +117,41 @@ def request_with_token_refresh(token_manager: OscTokenManager, request_fn):
     return response
 
 
-def _resolve_osc_api_url(osc_api_url_choice: str) -> str:
+def _resolve_osc_api_url(osc_api_url_choice: str, source: str = OSC_API_URL_CSV_COLUMN) -> str:
+    osc_api_url_choice = (osc_api_url_choice or "").strip()
     if isinstance(OSC_API_URL, dict):
         value = OSC_API_URL.get(osc_api_url_choice)
         if not value:
-            print(f"Error: OSC_API_URL missing key '{osc_api_url_choice}' in config.")
+            allowed = ", ".join(OSC_API_URL.keys())
+            print(
+                f"Error: {source} value '{osc_api_url_choice}' is not configured in OSC_API_URL. "
+                f"Expected one of: {allowed}."
+            )
             sys.exit(1)
         return value
     if osc_api_url_choice:
-        print("Error: --osc-api-url requires OSC_API_URL to be configured as a dict in config.py.")
+        print(f"Error: {source} can only be used when OSC_API_URL is configured as a dict in config.py.")
         sys.exit(1)
     return OSC_API_URL
+
+
+def _set_resolved_osc_api_url_from_row(row: list, idx: dict) -> None:
+    global RESOLVED_OSC_API_URL
+    RESOLVED_OSC_API_URL = _resolve_osc_api_url(row[idx[OSC_API_URL_CSV_COLUMN]])
+
+
+def _required_csv_columns(forced_mode: bool) -> list[str]:
+    required_columns = ["server_id", "account_id", OSC_API_URL_CSV_COLUMN, *PUPPET_PARAM_CSV_COLUMNS]
+    if not forced_mode:
+        required_columns.extend([
+            "pairing_profile_name", "application_label_href", "env_label_href",
+            "location_label_href", "role_label_href", "os_label_href"
+        ])
+    return required_columns
+
+
+def _build_puppet_params_from_row(row: list, idx: dict) -> dict:
+    return {column: row[idx[column]].strip() for column in PUPPET_PARAM_CSV_COLUMNS}
 
 
 def _read_csv_rows_with_auto_delimiter(input_path: str):
@@ -151,12 +177,7 @@ def create_output_csv_with_extra_columns(input_path: str, pce_name: str, forced_
     output_filename = f"{timestamp}_{pce_name}_gen2_bulk_install_result.csv"
     output_path = os.path.join(input_dir, output_filename)
 
-    required_columns = ["server_id", "account_id"]
-    if not forced_mode:
-        required_columns.extend([
-            "pairing_profile_name", "application_label_href", "env_label_href",
-            "location_label_href", "role_label_href", "enforcement_mode"
-        ])
+    required_columns = _required_csv_columns(forced_mode)
     rows, delimiter = _read_csv_rows_with_auto_delimiter(input_path)
     if not rows:
         print("Error: Input CSV is empty.")
@@ -209,7 +230,7 @@ def get_or_create_pairing_profile(pce: 'PolicyComputeEngine', pairing_profile_na
         return {'error': f"{status_code or 'Could not get Pairing Profile'}: {str(exc)}"}
 
 
-def build_osc_association_payload(profile_id: int, ac: str, pce_name: str):
+def build_osc_association_payload(profile_id: int, ac: str, pce_name: str, puppet_params: dict):
     return {
         "modules": [{
             "name": "sg_illumio_ven",
@@ -219,16 +240,17 @@ def build_osc_association_payload(profile_id: int, ac: str, pce_name: str):
                 "ac": ac,
                 "v1": "true",
                 "env_type": pce_name,
+                **puppet_params,
             },
         }]
     }
 
 
-def get_osc_association_payload(pce: 'PolicyComputeEngine', pairing_profile_href: str, pce_name: str):
+def get_osc_association_payload(pce: 'PolicyComputeEngine', pairing_profile_href: str, pce_name: str, puppet_params: dict):
     try:
         profile_id = int(pairing_profile_href.split("/")[-1])
         pairing_key = pce.generate_pairing_key(pairing_profile_href)
-        return build_osc_association_payload(profile_id, pairing_key, pce_name)
+        return build_osc_association_payload(profile_id, pairing_key, pce_name, puppet_params)
     except Exception as exc:
         status_code = getattr(exc, 'status_code', None)
         return {'error': f"{status_code or 'Could not get association payload'}: {str(exc)}"}
@@ -325,9 +347,24 @@ def _detect_os_type(row: list, idx: dict) -> str:
 
 
 def main():
-    global RESOLVED_OSC_API_URL
-    parser = argparse.ArgumentParser(description="Bulk install + monitor Illumio agents by batches of 5.")
-    parser.add_argument('-f', '--file-path', type=str, required=True)
+    parser = argparse.ArgumentParser(
+        description="Bulk install + monitor Illumio agents by batches of 5.",
+        epilog=(
+            f"Input CSV must include: server_id, account_id, {OSC_API_URL_CSV_COLUMN}, "
+            f"{', '.join(PUPPET_PARAM_CSV_COLUMNS)}. "
+            "Unless force mode is used, it must also include: pairing_profile_name, "
+            "application_label_href, env_label_href, location_label_href, role_label_href, os_label_href. "
+            f"When OSC_API_URL is a dict, {OSC_API_URL_CSV_COLUMN} must be one of: "
+            f"{', '.join(OSC_API_URL_CHOICES)}."
+        )
+    )
+    parser.add_argument(
+        '-f', '--file-path', type=str, required=True,
+        help=(
+            f"Input CSV path. Required columns: server_id, account_id, "
+            f"{OSC_API_URL_CSV_COLUMN}, {', '.join(PUPPET_PARAM_CSV_COLUMNS)}."
+        )
+    )
     parser.add_argument('--pce', type=str, choices=['dev', 'uat', 'prd', 'prd_critapps'], required=True)
     parser.add_argument('--pce-username', type=str, required=False,
                         help='Illumio API username (required unless --force-profile-id/--force-ac is used)')
@@ -336,7 +373,6 @@ def main():
     parser.add_argument('--osc-client-id', type=str, required=True)
     parser.add_argument('--osc-client-secret', type=str, required=False)
     parser.add_argument('--osc-account-id', type=str, required=True)
-    parser.add_argument('--osc-api-url', type=str, choices=OSC_API_URL_CHOICES, required=False)
     parser.add_argument('--batch-size', type=int, default=5)
     parser.add_argument('--poll-interval', type=int, default=20)
     parser.add_argument('--force-profile-id', type=int, required=False,
@@ -353,7 +389,6 @@ def main():
         sys.stdout = TeeStdout(original_stdout, log_file)
         print(f"[LOG] Output is also written to: {log_path}")
 
-        RESOLVED_OSC_API_URL = _resolve_osc_api_url(args.osc_api_url)
         forced_mode = args.force_profile_id is not None or bool(args.force_ac)
         if forced_mode and not (args.force_profile_id is not None and bool(args.force_ac)):
             print('Error: --force-profile-id and --force-ac must be provided together.')
@@ -390,14 +425,18 @@ def main():
                 running = []
 
                 for row in batch:
+                    _set_resolved_osc_api_url_from_row(row, idx)
                     server_id = row[idx['server_id']]
                     account_id = row[idx['account_id']]
                     profile_name = row[idx['pairing_profile_name']] if 'pairing_profile_name' in idx else ''
-                    enforcement_mode = row[idx['enforcement_mode']] if 'enforcement_mode' in idx else ''
+                    puppet_params = _build_puppet_params_from_row(row, idx)
+                    enforcement_mode = puppet_params['enforcement_mode']
                     print(f"[START] server={server_id} account={account_id} profile={profile_name}")
 
                     if forced_mode:
-                        payload = build_osc_association_payload(args.force_profile_id, args.force_ac, args.pce)
+                        payload = build_osc_association_payload(
+                            args.force_profile_id, args.force_ac, args.pce, puppet_params
+                        )
                         print(f"  [FORCED] profile_id={args.force_profile_id} ac=<provided>")
                     else:
                         labels = [
@@ -413,7 +452,7 @@ def main():
                             print(f"  [ERROR] pairing profile: {row[idx['error']]}")
                             continue
 
-                        payload = get_osc_association_payload(pce, profile.href, args.pce)
+                        payload = get_osc_association_payload(pce, profile.href, args.pce, puppet_params)
                         if isinstance(payload, dict) and 'error' in payload:
                             row[idx['error']] = payload['error']
                             print(f"  [ERROR] payload: {row[idx['error']]}")
@@ -441,6 +480,7 @@ def main():
                     print(f"[MONITOR] {len(running)} job(s) en cours...")
                     remaining = []
                     for row in running:
+                        _set_resolved_osc_api_url_from_row(row, idx)
                         server_id = row[idx['server_id']]
                         account_id = row[idx['account_id']]
                         job_id = row[idx['install_job_id']]
