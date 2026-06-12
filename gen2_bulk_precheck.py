@@ -21,6 +21,7 @@ from config import PCE_LIST
 FINAL_STATES = {"failed", "success"}
 ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
 OSC_API_URL_CHOICES = ["PARIS", "NORTH", "AMER", "ASIA"]
+OSC_API_URL_CSV_COLUMN = "osc_api_url"
 RESOLVED_OSC_API_URL = OSC_API_URL if isinstance(OSC_API_URL, str) else ""
 
 
@@ -117,17 +118,27 @@ def request_with_token_refresh(token_manager: OscTokenManager, request_fn):
     return response
 
 
-def _resolve_osc_api_url(osc_api_url_choice: str) -> str:
+def _resolve_osc_api_url(osc_api_url_choice: str, source: str = OSC_API_URL_CSV_COLUMN) -> str:
+    osc_api_url_choice = (osc_api_url_choice or "").strip()
     if isinstance(OSC_API_URL, dict):
         value = OSC_API_URL.get(osc_api_url_choice)
         if not value:
-            print(f"Error: OSC_API_URL missing key '{osc_api_url_choice}' in config.")
+            allowed = ", ".join(OSC_API_URL.keys())
+            print(
+                f"Error: {source} value '{osc_api_url_choice}' is not configured in OSC_API_URL. "
+                f"Expected one of: {allowed}."
+            )
             sys.exit(1)
         return value
     if osc_api_url_choice:
-        print("Error: --osc-api-url requires OSC_API_URL to be configured as a dict in config.py.")
+        print(f"Error: {source} can only be used when OSC_API_URL is configured as a dict in config.py.")
         sys.exit(1)
     return OSC_API_URL
+
+
+def _set_resolved_osc_api_url_from_row(row: list, idxs: dict) -> None:
+    global RESOLVED_OSC_API_URL
+    RESOLVED_OSC_API_URL = _resolve_osc_api_url(row[idxs[OSC_API_URL_CSV_COLUMN]])
 
 
 def _read_csv_rows_with_auto_delimiter(input_path: str):
@@ -153,7 +164,7 @@ def create_output_csv_with_extra_columns(input_path: str) -> tuple[str, str]:
     output_filename = f"{timestamp}_gen2_precheck_result.csv"
     output_path = os.path.join(input_dir, output_filename)
 
-    required_columns = ["server_id", "account_id"]
+    required_columns = ["server_id", "account_id", OSC_API_URL_CSV_COLUMN]
     rows, delimiter = _read_csv_rows_with_auto_delimiter(input_path)
     if not rows:
         print("Error: Input CSV is empty.")
@@ -300,14 +311,20 @@ def _compute_final_result(row, idxs):
 
 
 def main():
-    global RESOLVED_OSC_API_URL
-    parser = argparse.ArgumentParser(description="Run + monitor Gen2 prechecks from one CSV.")
-    parser.add_argument('-f', '--file-path', type=str, required=True)
+    parser = argparse.ArgumentParser(
+        description="Run + monitor Gen2 prechecks from one CSV.",
+        epilog=f"Input CSV must include: server_id, account_id, {OSC_API_URL_CSV_COLUMN}. "
+               f"When OSC_API_URL is a dict, {OSC_API_URL_CSV_COLUMN} must be one of: "
+               f"{', '.join(OSC_API_URL_CHOICES)}."
+    )
+    parser.add_argument(
+        '-f', '--file-path', type=str, required=True,
+        help=f"Input CSV path. Required columns: server_id, account_id, {OSC_API_URL_CSV_COLUMN}."
+    )
     parser.add_argument('--pce', type=str, choices=['dev', 'uat', 'prd', 'prd_critapps'], required=True)
     parser.add_argument('--osc-client-id', type=str, required=True)
     parser.add_argument('--osc-client-secret', type=str, required=False)
     parser.add_argument('--osc-account-id', type=str, required=True)
-    parser.add_argument('--osc-api-url', type=str, choices=OSC_API_URL_CHOICES, required=False)
     parser.add_argument('--batch-size', type=int, default=5)
     parser.add_argument('--poll-interval', type=int, default=20)
     parser.add_argument('--max-retries', type=int, default=None,
@@ -324,7 +341,6 @@ def main():
         sys.stdout = TeeStdout(original_stdout, log_file)
         print(f"[LOG] Output is also written to: {log_path}")
 
-        RESOLVED_OSC_API_URL = _resolve_osc_api_url(args.osc_api_url)
         if not args.osc_client_secret:
             args.osc_client_secret = getpass(prompt='Osconfig Client secret: ')
 
@@ -350,6 +366,7 @@ def main():
             status_tracker = {}
             with OscTokenManager(acl_token_generator) as token_manager:
                 for row in batch:
+                    _set_resolved_osc_api_url_from_row(row, idxs)
                     sid = row[idxs['server_id']]
                     aid = row[idxs['account_id']]
                     print(f"  -> {sid}: associate module + launch job")
@@ -381,6 +398,7 @@ def main():
                     for item in running:
                         row = item['row']
                         phase = item.get('phase', 'precheck_output')
+                        _set_resolved_osc_api_url_from_row(row, idxs)
                         sid, aid = row[idxs['server_id']], row[idxs['account_id']]
                         job_id = row[idxs['precheck_job_id']]
                         retries_count = int(row[idxs['precheck_retries']]) if row[idxs['precheck_retries']] else 0
@@ -466,6 +484,7 @@ def main():
 
                 print(f"  Cleanup batch {batch_no}: dissociate module for processed servers...")
                 for row in batch:
+                    _set_resolved_osc_api_url_from_row(row, idxs)
                     sid = row[idxs['server_id']]
                     aid = row[idxs['account_id']]
                     dissociate_puppet_module_from_server(sid, aid, token_manager)
