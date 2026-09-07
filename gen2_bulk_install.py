@@ -48,7 +48,8 @@ def _build_xlsx_output_path(output_csv_path: str) -> str:
     return f"{os.path.splitext(output_csv_path)[0]}.xlsx"
 
 
-def _write_xlsx_output(output_csv_path: str, delimiter: str, result_column: str):
+def _write_xlsx_output(output_csv_path: str, delimiter: str, result_column: str,
+                       dissociation_column: str | None = None):
     rows, _ = _read_csv_rows_with_auto_delimiter(output_csv_path)
     headers = rows[0] + ["Started at", "Finished at", "Operation result"]
     wb = Workbook()
@@ -61,7 +62,12 @@ def _write_xlsx_output(output_csv_path: str, delimiter: str, result_column: str)
         status_value = ''
         if status_idx is not None and status_idx < len(row):
             status_value = row[status_idx]
-        operation_result = "OK" if str(status_value).lower() in ("success", "ok") else "KO"
+        operation_ok = str(status_value).lower() in ("success", "ok")
+        if dissociation_column and dissociation_column in rows[0]:
+            dissociation_idx = rows[0].index(dissociation_column)
+            dissociation_value = row[dissociation_idx] if dissociation_idx < len(row) else ""
+            operation_ok = operation_ok and str(dissociation_value).lower() == "success"
+        operation_result = "OK" if operation_ok else "KO"
         safe_row = [_sanitize_xlsx_cell_value(v) for v in (row + ["", "", operation_result])]
         ws.append(safe_row)
 
@@ -171,13 +177,21 @@ def _read_csv_rows_with_auto_delimiter(input_path: str):
         sys.exit(1)
 
 
-def create_output_csv_with_extra_columns(input_path: str, pce_name: str, forced_mode: bool) -> tuple[str, str]:
+def _is_blank_csv_row(row: list) -> bool:
+    return not row or all(not str(value).strip() for value in row)
+
+
+def create_output_csv_with_extra_columns(input_path: str, pce_name: str, forced_mode: bool,
+                                         operation: str = "install") -> tuple[str, str]:
     input_dir = os.path.dirname(input_path)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"{timestamp}_{pce_name}_gen2_bulk_install_result.csv"
+    output_filename = f"{timestamp}_{pce_name}_gen2_bulk_{operation}_result.csv"
     output_path = os.path.join(input_dir, output_filename)
 
-    required_columns = _required_csv_columns(forced_mode)
+    required_columns = (
+        ["server_id", "account_id", OSC_API_URL_CSV_COLUMN]
+        if operation == "uninstall" else _required_csv_columns(forced_mode)
+    )
     rows, delimiter = _read_csv_rows_with_auto_delimiter(input_path)
     if not rows:
         print("Error: Input CSV is empty.")
@@ -189,12 +203,18 @@ def create_output_csv_with_extra_columns(input_path: str, pce_name: str, forced_
             print(f"Error: Input CSV missing required column '{col}'.")
             sys.exit(1)
 
-    headers = rows[0] + ["error", "install_job_id", "install_status", "seen_in_pce"]
+    operation_columns = ["error", f"{operation}_job_id", f"{operation}_status"]
+    if operation == "install":
+        operation_columns.append("seen_in_pce")
+    else:
+        operation_columns.extend(["association_status", "dissociation_status"])
+    headers = rows[0] + operation_columns
     with open(output_path, 'w', newline='', encoding='utf-8') as outfile:
         writer = csv.writer(outfile, delimiter=delimiter)
         writer.writerow(headers)
         for row in rows[1:]:
-            writer.writerow(row + ["", "", "", ""])
+            if not _is_blank_csv_row(row):
+                writer.writerow(row + [""] * len(operation_columns))
 
     return output_path, delimiter
 
@@ -244,6 +264,11 @@ def build_osc_association_payload(profile_id: int, ac: str, pce_name: str, puppe
             },
         }]
     }
+
+
+def build_osc_uninstall_payload():
+    """Associate the production module in removal mode before running Puppet."""
+    return {"modules": [{"name": "sg_illumio_ven", "params": {"ensure": "absent"}}]}
 
 
 def get_osc_association_payload(pce: 'PolicyComputeEngine', pairing_profile_href: str, pce_name: str, puppet_params: dict):
@@ -301,17 +326,20 @@ def run_install(server_id: str, account_id: str, os_type: str, token_manager: Os
 
 
 def get_job_status(job_id: str, account_id: str, token_manager: OscTokenManager):
-    url = f"{RESOLVED_OSC_API_URL.rstrip('/')}/jobs/{job_id}"
-    response = request_with_token_refresh(
-        token_manager,
-        lambda token: requests.get(
-            url,
-            headers={"Authorization": token.authorization_header, "X-Target-Account-Id": account_id},
-        ),
-    )
-    if response.status_code != 200:
-        return {'error': f"{response.status_code}: {response.text}"}
-    return response.json().get("job", {})
+    try:
+        url = f"{RESOLVED_OSC_API_URL.rstrip('/')}/jobs/{job_id}"
+        response = request_with_token_refresh(
+            token_manager,
+            lambda token: requests.get(
+                url,
+                headers={"Authorization": token.authorization_header, "X-Target-Account-Id": account_id},
+            ),
+        )
+        if response.status_code != 200:
+            return {'error': f"{response.status_code}: {response.text}"}
+        return response.json().get("job", {})
+    except Exception as exc:
+        return {'error': str(exc)}
 
 
 def dissociate_module(server_id: str, account_id: str, token_manager: OscTokenManager):
@@ -346,30 +374,35 @@ def _detect_os_type(row: list, idx: dict) -> str:
     return "windows" if "windows" in fingerprint else "linux"
 
 
-def main():
+def _build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Bulk install + monitor Illumio agents by batches of 5.",
+        description="Bulk install or uninstall Illumio agents through OSC/Puppet.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            f"Input CSV must include: server_id, account_id, {OSC_API_URL_CSV_COLUMN}, "
-            f"{', '.join(PUPPET_PARAM_CSV_COLUMNS)}. "
-            "Unless force mode is used, it must also include: pairing_profile_name, "
-            "application_label_href, env_label_href, location_label_href, role_label_href, os_label_href. "
+            "Required input CSV columns by operation:\n"
+            f"  Install:   server_id, account_id, {OSC_API_URL_CSV_COLUMN}, "
+            f"{', '.join(PUPPET_PARAM_CSV_COLUMNS)}\n"
+            "  Install without --force-profile-id/--force-ac also requires:\n"
+            "             pairing_profile_name, application_label_href, env_label_href,\n"
+            "             location_label_href, role_label_href, os_label_href\n"
+            f"  Uninstall: server_id, account_id, {OSC_API_URL_CSV_COLUMN}\n\n"
+            "Blank or whitespace-only input rows are ignored.\n"
             f"When OSC_API_URL is a dict, {OSC_API_URL_CSV_COLUMN} must be one of: "
             f"{', '.join(OSC_API_URL_CHOICES)}."
-        )
+        ),
     )
     parser.add_argument(
         '-f', '--file-path', type=str, required=True,
         help=(
-            f"Input CSV path. Required columns: server_id, account_id, "
-            f"{OSC_API_URL_CSV_COLUMN}, {', '.join(PUPPET_PARAM_CSV_COLUMNS)}."
+            "Input CSV path; required columns depend on install/uninstall mode "
+            "and are listed below."
         )
     )
     parser.add_argument('--pce', type=str, choices=['dev', 'uat', 'prd', 'prd_critapps'], required=True)
     parser.add_argument('--pce-username', type=str, required=False,
-                        help='Illumio API username (required unless --force-profile-id/--force-ac is used)')
+                        help='Illumio API username (install only; not required with force mode or --uninstall)')
     parser.add_argument('--pce-password', type=str, required=False,
-                        help='Illumio API password (required unless --force-profile-id/--force-ac is used)')
+                        help='Illumio API password (install only; not required with force mode or --uninstall)')
     parser.add_argument('--osc-client-id', type=str, required=True)
     parser.add_argument('--osc-client-secret', type=str, required=False)
     parser.add_argument('--osc-account-id', type=str, required=True)
@@ -379,6 +412,19 @@ def main():
                         help='Force profile_id in OSC payload and skip pairing profile generation on PCE (must be used with --force-ac)')
     parser.add_argument('--force-ac', type=str, required=False,
                         help='Force pairing key (ac) in OSC payload and skip pairing key generation on PCE (must be used with --force-profile-id)')
+    parser.add_argument(
+        '--uninstall', action='store_true',
+        help=(
+            'Uninstall the agent by associating sg_illumio_ven with ensure=absent, '
+            'running Puppet, then dissociating the module. Only server_id, account_id '
+            f'and {OSC_API_URL_CSV_COLUMN} are required in the input CSV.'
+        ),
+    )
+    return parser
+
+
+def main():
+    parser = _build_argument_parser()
     args = parser.parse_args()
 
     original_stdout = sys.stdout
@@ -389,23 +435,29 @@ def main():
         sys.stdout = TeeStdout(original_stdout, log_file)
         print(f"[LOG] Output is also written to: {log_path}")
 
+        operation = "uninstall" if args.uninstall else "install"
         forced_mode = args.force_profile_id is not None or bool(args.force_ac)
+        if args.uninstall and forced_mode:
+            print('Error: --force-profile-id/--force-ac cannot be used with --uninstall.')
+            sys.exit(1)
         if forced_mode and not (args.force_profile_id is not None and bool(args.force_ac)):
             print('Error: --force-profile-id and --force-ac must be provided together.')
             sys.exit(1)
 
-        if not forced_mode and not args.pce_username:
+        if not args.uninstall and not forced_mode and not args.pce_username:
             print('Error: --pce-username is required unless force mode is used.')
             sys.exit(1)
 
-        if not forced_mode and not args.pce_password:
+        if not args.uninstall and not forced_mode and not args.pce_password:
             args.pce_password = getpass(prompt='Illumio API password: ')
         if not args.osc_client_secret:
             args.osc_client_secret = getpass(prompt='Osconfig Client secret: ')
 
-        output_csv, delimiter = create_output_csv_with_extra_columns(args.file_path, args.pce, forced_mode)
+        output_csv, delimiter = create_output_csv_with_extra_columns(
+            args.file_path, args.pce, forced_mode, operation
+        )
         pce = None
-        if not forced_mode:
+        if not args.uninstall and not forced_mode:
             pce = get_pce_connection(args.pce, args.pce_username, args.pce_password)
 
         rows, _ = _read_csv_rows_with_auto_delimiter(output_csv)
@@ -429,16 +481,23 @@ def main():
                     server_id = row[idx['server_id']]
                     account_id = row[idx['account_id']]
                     profile_name = row[idx['pairing_profile_name']] if 'pairing_profile_name' in idx else ''
-                    puppet_params = _build_puppet_params_from_row(row, idx)
-                    enforcement_mode = puppet_params['enforcement_mode']
-                    print(f"[START] server={server_id} account={account_id} profile={profile_name}")
+                    print(
+                        f"[START] operation={operation} server={server_id} account={account_id}"
+                        + (f" profile={profile_name}" if not args.uninstall else "")
+                    )
 
-                    if forced_mode:
+                    if args.uninstall:
+                        payload = build_osc_uninstall_payload()
+                        print("  [UNINSTALL] preparing module sg_illumio_ven with ensure=absent")
+                    elif forced_mode:
+                        puppet_params = _build_puppet_params_from_row(row, idx)
                         payload = build_osc_association_payload(
                             args.force_profile_id, args.force_ac, args.pce, puppet_params
                         )
                         print(f"  [FORCED] profile_id={args.force_profile_id} ac=<provided>")
                     else:
+                        puppet_params = _build_puppet_params_from_row(row, idx)
+                        enforcement_mode = puppet_params['enforcement_mode']
                         labels = [
                             {"href": row[idx["role_label_href"]]},
                             {"href": row[idx["application_label_href"]]},
@@ -462,17 +521,39 @@ def main():
                     if 'error' in assoc:
                         row[idx['error']] = assoc['error']
                         print(f"  [ERROR] association: {row[idx['error']]}")
+                        if args.uninstall:
+                            row[idx['association_status']] = 'failed'
+                            row[idx['uninstall_status']] = 'error'
+                            dis = dissociate_module(server_id, account_id, token_manager)
+                            row[idx['dissociation_status']] = 'failed' if 'error' in dis else 'success'
+                            if 'error' in dis:
+                                row[idx['error']] += f" | dissociation: {dis['error']}"
+                                print(f"  [WARN] dissociation failed server={server_id}: {dis['error']}")
+                            else:
+                                print(f"  [CLEANUP] module dissociated successfully server={server_id}")
                         continue
+                    if args.uninstall:
+                        row[idx['association_status']] = 'success'
+                    print(f"  [OK] module associated server={server_id} ensure={'absent' if args.uninstall else 'present'}")
 
                     os_type = _detect_os_type(row, idx)
                     job_res = run_install(server_id, account_id, os_type, token_manager)
                     if isinstance(job_res, dict):
                         row[idx['error']] = job_res['error']
-                        print(f"  [ERROR] run install: {row[idx['error']]}")
+                        row[idx[f'{operation}_status']] = 'error'
+                        print(f"  [ERROR] run {operation}: {row[idx['error']]}")
+                        if args.uninstall:
+                            dis = dissociate_module(server_id, account_id, token_manager)
+                            row[idx['dissociation_status']] = 'failed' if 'error' in dis else 'success'
+                            if 'error' in dis:
+                                row[idx['error']] += f" | dissociation: {dis['error']}"
+                                print(f"  [WARN] dissociation failed server={server_id}: {dis['error']}")
+                            else:
+                                print(f"  [CLEANUP] module dissociated successfully server={server_id}")
                         continue
 
-                    row[idx['install_job_id']] = job_res
-                    row[idx['install_status']] = 'running'
+                    row[idx[f'{operation}_job_id']] = job_res
+                    row[idx[f'{operation}_status']] = 'running'
                     running.append(row)
                     print(f"  [OK] job launched job_id={job_res} os_type={os_type}")
 
@@ -483,18 +564,26 @@ def main():
                         _set_resolved_osc_api_url_from_row(row, idx)
                         server_id = row[idx['server_id']]
                         account_id = row[idx['account_id']]
-                        job_id = row[idx['install_job_id']]
+                        job_id = row[idx[f'{operation}_job_id']]
                         status_obj = get_job_status(job_id, account_id, token_manager)
                         if isinstance(status_obj, dict) and 'error' in status_obj:
                             row[idx['error']] = status_obj['error']
-                            row[idx['install_status']] = 'error'
+                            row[idx[f'{operation}_status']] = 'error'
                             print(f"  [ERROR] server={server_id} job={job_id}: {row[idx['error']]}")
+                            if args.uninstall:
+                                dis = dissociate_module(server_id, account_id, token_manager)
+                                row[idx['dissociation_status']] = 'failed' if 'error' in dis else 'success'
+                                if 'error' in dis:
+                                    row[idx['error']] += f" | dissociation: {dis['error']}"
+                                    print(f"  [WARN] dissociation failed server={server_id}: {dis['error']}")
+                                else:
+                                    print(f"  [CLEANUP] module dissociated successfully server={server_id}")
                             continue
 
                         status = (status_obj.get('status') or '').lower()
                         reason = status_obj.get('reason') or ''
                         message = status_obj.get('message') or ''
-                        row[idx['install_status']] = status
+                        row[idx[f'{operation}_status']] = status
                         if reason:
                             row[idx['error']] = f"{message}: {reason}" if message else reason
                         print(f"  [STATUS] server={server_id} job={job_id} -> {status}")
@@ -504,9 +593,18 @@ def main():
                             if 'error' in dis:
                                 row[idx['error']] = f"{row[idx['error']]} | dissociation: {dis['error']}".strip(" |")
                                 print(f"  [WARN] dissociation failed server={server_id}: {dis['error']}")
+                                if args.uninstall:
+                                    row[idx['dissociation_status']] = 'failed'
                             else:
-                                print(f"  [CLEANUP] module dissociated server={server_id}")
-                            if status == 'success' and pce is not None and 'hostname' in idx and 'ip_address' in idx:
+                                if args.uninstall:
+                                    row[idx['dissociation_status']] = 'success'
+                                print(f"  [CLEANUP] module dissociated successfully server={server_id}")
+                            if args.uninstall:
+                                print(
+                                    f"  [UNINSTALL RESULT] server={server_id} uninstall={status} "
+                                    f"dissociation={row[idx['dissociation_status']]}"
+                                )
+                            if not args.uninstall and status == 'success' and pce is not None and 'hostname' in idx and 'ip_address' in idx:
                                 hostname = row[idx['hostname']].strip()
                                 ip_address = row[idx['ip_address']].strip()
                                 if hostname and ip_address:
@@ -526,9 +624,15 @@ def main():
             writer.writerow(headers)
             writer.writerows(data_rows)
 
-        output_xlsx = _write_xlsx_output(output_csv, delimiter, "install_status")
-        print(f"\nEND: installation terminée. Résultats CSV: {output_csv}")
-        print(f"END: installation terminée. Résultats XLSX: {output_xlsx}")
+        output_xlsx = _write_xlsx_output(
+            output_csv,
+            delimiter,
+            f"{operation}_status",
+            "dissociation_status" if args.uninstall else None,
+        )
+        operation_label = "désinstallation" if args.uninstall else "installation"
+        print(f"\nEND: {operation_label} terminée. Résultats CSV: {output_csv}")
+        print(f"END: {operation_label} terminée. Résultats XLSX: {output_xlsx}")
     finally:
         sys.stdout = original_stdout
         if log_file:
